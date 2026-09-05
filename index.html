@@ -95,7 +95,24 @@ Feliz Dia dos Namorados Amoreco ❤️.</p></div>
 <div class="footer">Feito com ❤️ para você</div>
 </div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  
 <script>
+  const SUPABASE_URL = "https://vsqwznrkrcwbjhzucttb.supabase.co";
+const SUPABASE_KEY = "sb_publishable_vvUN6NcY54p4Cbj4fGhojQ_Pa_KTptP";
+
+const supabase = window.supabase.createClient(
+    SUPABASE_URL,
+    SUPABASE_KEY
+);
+  supabase.from('messages').select('id').limit(1)
+    .then(({ data, error }) => {
+        if (error) {
+            console.error("Erro ao conectar com Supabase:", error);
+        } else {
+            console.log("Supabase conectado com sucesso! ✅", data);
+        }
+    });
 const startDate=new Date("2026-03-08T00:00:00");
 function updateCounter(){
 let diff=new Date()-startDate;
