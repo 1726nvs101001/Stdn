@@ -94,6 +94,9 @@ display:flex;flex-direction:column;gap:9px;
 .message.theirs{align-self:flex-start;background:#fff;border-bottom-left-radius:5px}
 .message-name{font-size:.72rem;font-weight:600;margin-bottom:3px}
 .message-time{font-size:.65rem;opacity:.6;margin-top:4px;text-align:right}
+.message-read{margin-left:5px;font-size:.72rem;letter-spacing:-2px;opacity:.72}
+.message-read.read{opacity:1}
+.chat-typing{min-height:20px;margin:5px 4px 0;font-size:.72rem;font-style:italic;opacity:.68;text-align:left}
 .chat-compose{display:flex;gap:9px;margin-top:12px}
 .chat-compose input{flex:1}
 .chat-send{width:auto;min-width:95px;margin-top:0}
@@ -169,6 +172,7 @@ Feliz Dia dos Namorados Amoreco ❤️.</p></div>
 <button id="chatLogout" class="chat-logout" type="button">Sair</button>
 </div>
 <div id="messages" class="messages"><div class="chat-loading">Carregando mensagens...</div></div>
+<div id="chatTyping" class="chat-typing" aria-live="polite"></div>
 <div class="chat-compose">
 <input id="chatMessageInput" class="chat-input" type="text" maxlength="2000" placeholder="Escreva uma mensagem..." autocomplete="off">
 <button id="chatSendButton" class="chat-button chat-send" type="button">Enviar 💗</button>
@@ -235,6 +239,12 @@ const CHAT_USERS = {
 
 let currentChatUser = null;
 let messagesChannel = null;
+let messageVisibilityObserver = null;
+const messagesBeingMarkedRead = new Set();
+
+let typingStopTimer = null;
+let typingVisibleTimer = null;
+let isTypingBroadcasted = false;
 
 const chatLoginEl = document.getElementById("chatLogin");
 const chatAreaEl = document.getElementById("chatArea");
@@ -245,6 +255,7 @@ const chatLoginStatusEl = document.getElementById("chatLoginStatus");
 const chatCurrentUserEl = document.getElementById("chatCurrentUser");
 const chatLogoutEl = document.getElementById("chatLogout");
 const messagesEl = document.getElementById("messages");
+const chatTypingEl = document.getElementById("chatTyping");
 const chatMessageInputEl = document.getElementById("chatMessageInput");
 const chatSendButtonEl = document.getElementById("chatSendButton");
 const chatSendStatusEl = document.getElementById("chatSendStatus");
@@ -273,7 +284,182 @@ function escapeText(text){
         .replaceAll("'","&#039;");
 }
 
+// Proteção contra tentativas repetidas de senha no login do chat.
+const CHAT_LOGIN_MAX_ATTEMPTS = 5;
+const CHAT_LOGIN_LOCK_TIME = 60 * 1000;
+const CHAT_LOGIN_STORAGE_KEY = "chatLoginRateLimit";
+let chatLoginCountdown = null;
+
+function getChatLoginRateLimit(){
+    try{
+        const saved = JSON.parse(localStorage.getItem(CHAT_LOGIN_STORAGE_KEY) || "null");
+        if(!saved || typeof saved !== "object") return { attempts:0, lockedUntil:0 };
+        return {
+            attempts: Number.isFinite(saved.attempts) ? saved.attempts : 0,
+            lockedUntil: Number.isFinite(saved.lockedUntil) ? saved.lockedUntil : 0
+        };
+    }catch(error){
+        return { attempts:0, lockedUntil:0 };
+    }
+}
+
+function saveChatLoginRateLimit(state){
+    try{
+        localStorage.setItem(CHAT_LOGIN_STORAGE_KEY, JSON.stringify(state));
+    }catch(error){
+        console.warn("Não foi possível salvar o limite de tentativas:", error);
+    }
+}
+
+function setChatLoginLocked(locked, seconds=60){
+    chatPasswordEl.disabled = locked;
+    chatNameEl.disabled = locked;
+    chatLoginButtonEl.disabled = locked;
+
+    if(chatLoginCountdown){
+        clearInterval(chatLoginCountdown);
+        chatLoginCountdown = null;
+    }
+
+    if(locked){
+        const updateCountdown = () => {
+            const remaining = Math.max(0, Math.ceil(seconds));
+            if(remaining <= 0){
+                setChatLoginLocked(false);
+                setChatStatus(chatLoginStatusEl, "Você pode tentar novamente.", "ok");
+                return;
+            }
+            setChatStatus(
+                chatLoginStatusEl,
+                `Muitas tentativas incorretas. Aguarde ${remaining} segundo${remaining === 1 ? "" : "s"} para tentar novamente.`,
+                "error"
+            );
+            seconds = remaining - 1;
+        };
+
+        updateCountdown();
+        chatLoginCountdown = setInterval(updateCountdown, 1000);
+    }else{
+        chatLoginButtonEl.textContent = "Entrar no nosso chat 💕";
+    }
+}
+
+function restoreChatLoginRateLimit(){
+    const state = getChatLoginRateLimit();
+
+    if(state.lockedUntil > Date.now()){
+        const remainingSeconds = Math.ceil((state.lockedUntil - Date.now()) / 1000);
+        setChatLoginLocked(true, remainingSeconds);
+        return;
+    }
+
+    if(state.lockedUntil > 0){
+        saveChatLoginRateLimit({ attempts:0, lockedUntil:0 });
+    }
+
+    setChatLoginLocked(false);
+}
+
+function registerFailedChatLogin(){
+    const state = getChatLoginRateLimit();
+    state.attempts += 1;
+
+    if(state.attempts >= CHAT_LOGIN_MAX_ATTEMPTS){
+        state.attempts = 0;
+        state.lockedUntil = Date.now() + CHAT_LOGIN_LOCK_TIME;
+        saveChatLoginRateLimit(state);
+        setChatLoginLocked(true, 60);
+        return;
+    }
+
+    saveChatLoginRateLimit(state);
+    const remainingAttempts = CHAT_LOGIN_MAX_ATTEMPTS - state.attempts;
+    setChatStatus(
+        chatLoginStatusEl,
+        `Nome ou senha incorretos. Restam ${remainingAttempts} tentativa${remainingAttempts === 1 ? "" : "s"}.`,
+        "error"
+    );
+}
+
+function resetChatLoginRateLimit(){
+    saveChatLoginRateLimit({ attempts:0, lockedUntil:0 });
+    setChatLoginLocked(false);
+}
+
+function getReadReceiptHTML(row, mine){
+    if(!mine) return "";
+
+    const read = !!row.read_at;
+    return `<span class="message-read ${read ? "read" : ""}" aria-label="${read ? "Visualizada" : "Enviada"}">${read ? "✓✓" : "✓"}</span>`;
+}
+
+function disconnectMessageVisibilityObserver(){
+    if(messageVisibilityObserver){
+        messageVisibilityObserver.disconnect();
+        messageVisibilityObserver = null;
+    }
+}
+
+function setupMessageVisibilityObserver(){
+    disconnectMessageVisibilityObserver();
+
+    if(!currentChatUser || !messagesEl) return;
+
+    messageVisibilityObserver = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+            if(!entry.isIntersecting || entry.intersectionRatio < 0.6) return;
+
+            const messageId = entry.target.dataset.messageId;
+            const senderId = entry.target.dataset.senderId;
+
+            if(!messageId || !senderId) return;
+            if(senderId === currentChatUser.id) return;
+            if(entry.target.dataset.readAt) return;
+
+            markMessageAsRead(messageId, entry.target);
+        });
+    }, {
+        root: messagesEl,
+        threshold: [0.6]
+    });
+
+    messagesEl.querySelectorAll(".message.theirs").forEach(messageEl => {
+        messageVisibilityObserver.observe(messageEl);
+    });
+}
+
+async function markMessageAsRead(messageId, messageEl){
+    if(!currentChatUser || !messageId || messagesBeingMarkedRead.has(String(messageId))) return;
+
+    messagesBeingMarkedRead.add(String(messageId));
+
+    const readAt = new Date().toISOString();
+
+    const { data, error } = await chatClient
+        .from("messages")
+        .update({ read_at: readAt })
+        .eq("id", messageId)
+        .eq("sender_id", messageEl.dataset.senderId)
+        .is("read_at", null)
+        .select("id, read_at")
+        .maybeSingle();
+
+    if(error){
+        console.error("Erro ao marcar mensagem como visualizada:", error);
+        messagesBeingMarkedRead.delete(String(messageId));
+        return;
+    }
+
+    if(data){
+        messageEl.dataset.readAt = data.read_at || readAt;
+    }
+
+    messagesBeingMarkedRead.delete(String(messageId));
+}
+
 function renderMessages(rows){
+    disconnectMessageVisibilityObserver();
+
     if(!rows || rows.length === 0){
         messagesEl.innerHTML = '<div class="chat-empty">Ainda não há mensagens.<br>Seja o primeiro a escrever ❤️</div>';
         return;
@@ -282,16 +468,41 @@ function renderMessages(rows){
     messagesEl.innerHTML = rows.map(row => {
         const mine = currentChatUser && row.sender_id === currentChatUser.id;
         const senderName = mine ? currentChatUser.name : "Giovanna";
+        const readAtAttribute = row.read_at ? ` data-read-at="${escapeText(row.read_at)}"` : "";
+
         return `
-            <div class="message ${mine ? "mine" : "theirs"}">
+            <div class="message ${mine ? "mine" : "theirs"}"
+                 data-message-id="${escapeText(row.id)}"
+                 data-sender-id="${escapeText(row.sender_id || "")}"${readAtAttribute}>
                 <div class="message-name">${escapeText(senderName)}</div>
                 <div>${escapeText(row.content)}</div>
-                <div class="message-time">${formatMessageTime(row.created_at)}</div>
+                <div class="message-time">
+                    ${formatMessageTime(row.created_at)}${getReadReceiptHTML(row, mine)}
+                </div>
             </div>
         `;
     }).join("");
 
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    setupMessageVisibilityObserver();
+}
+
+function updateMessageReadReceipt(row){
+    const messageEl = messagesEl.querySelector(`.message[data-message-id="${CSS.escape(String(row.id))}"]`);
+    if(!messageEl) return;
+
+    if(row.read_at){
+        messageEl.dataset.readAt = row.read_at;
+    }else{
+        delete messageEl.dataset.readAt;
+    }
+
+    const readEl = messageEl.querySelector(".message-read");
+    if(!readEl) return;
+
+    readEl.textContent = row.read_at ? "✓✓" : "✓";
+    readEl.classList.toggle("read", !!row.read_at);
+    readEl.setAttribute("aria-label", row.read_at ? "Visualizada" : "Enviada");
 }
 
 async function loadMessages(){
@@ -299,7 +510,7 @@ async function loadMessages(){
 
     const { data, error } = await chatClient
         .from("messages")
-        .select("id, created_at, sender_id, content")
+        .select("id, created_at, sender_id, content, read_at")
         .order("created_at", { ascending:true });
 
     if(error){
@@ -313,7 +524,77 @@ async function loadMessages(){
     renderMessages(data);
 }
 
+function clearTypingState(){
+    if(typingStopTimer){
+        clearTimeout(typingStopTimer);
+        typingStopTimer = null;
+    }
+
+    if(isTypingBroadcasted && messagesChannel){
+        messagesChannel.send({
+            type: "broadcast",
+            event: "typing",
+            payload: {
+                userId: currentChatUser ? currentChatUser.id : null,
+                userName: currentChatUser ? currentChatUser.name : null,
+                typing: false
+            }
+        }).catch(error => console.warn("Não foi possível avisar que parou de digitar:", error));
+    }
+
+    isTypingBroadcasted = false;
+}
+
+function showTypingIndicator(userName){
+    if(!currentChatUser || !userName || userName === currentChatUser.name) return;
+
+    chatTypingEl.textContent = `${userName} está digitando...`;
+
+    if(typingVisibleTimer){
+        clearTimeout(typingVisibleTimer);
+    }
+
+    typingVisibleTimer = setTimeout(() => {
+        chatTypingEl.textContent = "";
+        typingVisibleTimer = null;
+    }, 1800);
+}
+
+function handleTypingInput(){
+    if(!currentChatUser || !messagesChannel) return;
+
+    if(!isTypingBroadcasted){
+        isTypingBroadcasted = true;
+
+        messagesChannel.send({
+            type: "broadcast",
+            event: "typing",
+            payload: {
+                userId: currentChatUser.id,
+                userName: currentChatUser.name,
+                typing: true
+            }
+        }).catch(error => console.warn("Não foi possível enviar indicador de digitação:", error));
+    }
+
+    if(typingStopTimer){
+        clearTimeout(typingStopTimer);
+    }
+
+    typingStopTimer = setTimeout(() => {
+        clearTypingState();
+    }, 1400);
+}
+
 async function loginChat(){
+    const rateLimit = getChatLoginRateLimit();
+
+    if(rateLimit.lockedUntil > Date.now()){
+        const remainingSeconds = Math.ceil((rateLimit.lockedUntil - Date.now()) / 1000);
+        setChatLoginLocked(true, remainingSeconds);
+        return;
+    }
+
     const name = chatNameEl.value;
     const email = CHAT_USERS[name];
     const password = chatPasswordEl.value;
@@ -337,9 +618,11 @@ async function loginChat(){
 
     if(error){
         console.error("Erro de login:", error);
-        setChatStatus(chatLoginStatusEl, "Nome ou senha incorretos.", "error");
+        registerFailedChatLogin();
         return;
     }
+
+    resetChatLoginRateLimit();
 
     currentChatUser = {
         id: data.user.id,
@@ -395,14 +678,51 @@ function subscribeToMessages(){
                 const div = document.createElement("div");
                 div.className = "message " + (mine ? "mine" : "theirs");
                 div.dataset.messageId = row.id;
+                div.dataset.senderId = row.sender_id || "";
+                if(row.read_at) div.dataset.readAt = row.read_at;
+
                 div.innerHTML = `
                     <div class="message-name">${escapeText(senderName)}</div>
                     <div>${escapeText(row.content)}</div>
-                    <div class="message-time">${formatMessageTime(row.created_at)}</div>
+                    <div class="message-time">
+                        ${formatMessageTime(row.created_at)}${getReadReceiptHTML(row, mine)}
+                    </div>
                 `;
 
                 messagesEl.appendChild(div);
                 messagesEl.scrollTop = messagesEl.scrollHeight;
+
+                setupMessageVisibilityObserver();
+            }
+        )
+        .on(
+            "postgres_changes",
+            {
+                event:"UPDATE",
+                schema:"public",
+                table:"messages"
+            },
+            payload => {
+                updateMessageReadReceipt(payload.new);
+                setupMessageVisibilityObserver();
+            }
+        )
+        .on(
+            "broadcast",
+            {
+                event:"typing"
+            },
+            ({ payload }) => {
+                if(!payload || !payload.typing) {
+                    if(payload && payload.userId && currentChatUser && payload.userId !== currentChatUser.id){
+                        chatTypingEl.textContent = "";
+                    }
+                    return;
+                }
+
+                if(currentChatUser && payload.userId === currentChatUser.id) return;
+
+                showTypingIndicator(payload.userName);
             }
         )
         .subscribe(status => {
@@ -414,6 +734,8 @@ async function sendMessage(){
     const content = chatMessageInputEl.value.trim();
 
     if(!content) return;
+
+    clearTypingState();
 
     const { data: sessionData } = await chatClient.auth.getSession();
 
@@ -446,10 +768,19 @@ async function sendMessage(){
 }
 
 async function logoutChat(){
+    clearTypingState();
+
+    if(typingVisibleTimer){
+        clearTimeout(typingVisibleTimer);
+        typingVisibleTimer = null;
+    }
+
     if(messagesChannel){
         await chatClient.removeChannel(messagesChannel);
         messagesChannel = null;
     }
+
+    disconnectMessageVisibilityObserver();
 
     await chatClient.auth.signOut();
 
@@ -457,6 +788,7 @@ async function logoutChat(){
     chatAreaEl.style.display = "none";
     chatLoginEl.style.display = "block";
     messagesEl.innerHTML = "";
+    chatTypingEl.textContent = "";
     setChatStatus(chatLoginStatusEl, "Você saiu do chat.", "ok");
     setChatStatus(chatSendStatusEl, "");
 }
@@ -464,6 +796,10 @@ async function logoutChat(){
 chatLoginButtonEl.addEventListener("click", loginChat);
 chatLogoutEl.addEventListener("click", logoutChat);
 chatSendButtonEl.addEventListener("click", sendMessage);
+chatMessageInputEl.addEventListener("input", handleTypingInput);
+
+// Restaura o bloqueio caso a página seja recarregada durante o período de 1 minuto.
+restoreChatLoginRateLimit();
 
 chatMessageInputEl.addEventListener("keydown", event => {
     if(event.key === "Enter"){
